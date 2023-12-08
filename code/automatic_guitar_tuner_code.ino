@@ -7,7 +7,6 @@
 #include "LiquidCrystal.h"
 #include "megaAVR_PWM.h"
 
-
 /* NANO EVERY PINOUT:
 D2    Frequency Input Pin     (To Butterworth Filter)
 D3    Filter Clock Pin        (From Comparator)
@@ -41,6 +40,7 @@ D21   LCD E                   (To LCD Screen)
 */
 
 
+#define kN 20                // Kalman Iterations
 
 // FILTERING VARIABLES
 megaAVR_PWM* filterPWM;                   // PWM Generator Instance (for filter clock signal)
@@ -56,13 +56,13 @@ volatile long pulseStartTime = 0;         // Start micros of Pulses
 volatile bool newMeasurement = false;     // New Frequency Measurement check
 volatile long pulseEndTime = 0;           // End micros of pulses
 double frequency = 0;                     // Current Average freq
+double oldFreq = 0;
 double stringFrequency = 0;               // Target Frequency
 double freqErr = 0;                       // Difference in Averaged Freq and Target Freq
 bool inTune = false;                      // Status of Current String Tuning
 int curString = 0;                        // Current String (0-5 for Low-High)
 
 // MOTOR CONTROL VARIABLES
-//megaAVR_PWM* stepperPWM;                  // PWM Generator for Step Control
 const int dirPin = 4;                     // Direction Pin of the Motor Driver (HIGH Clockwise)
 const int enablePin = 5;
 const int stepPin = 6;                    // Step Pin of the Motor Driver (1 Step per Rising Edge)
@@ -73,9 +73,14 @@ int stepErr = 0;                  // Stepper motor PWM Frequency
 bool stepped = 0;                         // Alternating Step
 int steps = 0;                            // Steps taken so far
 int motorDirection = 1;                   // Current Direction of Motor
-const float alpha = 100;                   // Proportional Motor Control Coefficient
-float freqAvg = 0;
-float freqWindow[20];
+const float alpha = 100;                  // Proportional Motor Control Coefficient
+float freqAvg = 0;                        // Rolling Average of last frequencies
+float freqWindow[kN];                     // Kalman window
+unsigned long lastMicros = 0;             // Last Measured Microsecond timing (for kalman dt)
+bool startTuning = false;                 // Toggle to start motor turning
+float freqChecks[20];                     // Window for checking if string is correct (all values must be within tolerance to finish tuning)
+bool passedCheck = false;                 // Toggle if passed check
+float freqOffset =0.0;                    // Frequency offset to turn down past string and then back up
 
 // LCD PINS
 const int lcdD4Pin = 14;                  // LCD Data 4 Pin
@@ -94,11 +99,11 @@ const int buttonBack = 12;                // Back Button
 int selectedTuning = 0;                   // Currently selected tuning from menu
 int displayedTuning = 0;                  // Tuning currently displayed
 bool tuningSelected = false;              // If a tuning is currently selected or not
-volatile bool newDisplay = true;         // New Display data
+volatile bool newDisplay = true;          // New Display data
 int numTunings = 0;                       // Number of tunings in library
-int machineState = 0;                     // State Machine State (0 = Menu, 1 = Confirm Tuning, 2 = String Setup, 3 = Tuning)
-unsigned long timer = 0;
-unsigned long lastTimer = 0;
+int machineState = 0;                     // State Machine State (0 = Menu, 1 = Confirm Tuning, 2 = String Setup, 3 = Tuning, 4 = Done)
+unsigned long timer = 0;                  // Micros timer
+unsigned long lastTimer = 0;              // Last Micros timer
 
 // CUSTOM MENU CHARACTERS FOR LCD
 byte leftArrow[] = {
@@ -141,6 +146,7 @@ byte flat[] = {
   B01100,
   B01000
 };
+
 // TUNING DATA
 // read a table or store a list of possible tunings (name of tuning and all 6 string freqs)
 // https://fretsuccess.com/what-are-the-guitar-string-frequencies/
@@ -174,7 +180,19 @@ const float tuningFrequencies[][6] = {
   {73.42,   98.00,    146.83,   196.00,   246.94,   293.66}
   };
 
-
+// KALMAN FILTER
+float F = 0;            // Frequency Prediction State
+float Fm = 0;           // Frequency Updated
+float Fe = 0;           // Frequency Uncertainty
+float dt = 1;           // Time Step
+float dF = 1;           // Change in Frequency per Time
+float q = 5;            // Process Noise Variance
+float dFe = 1;          // Frequency Uncertainty Change
+float z = 0;            // Previous Iteration
+float Z[kN];            // Kalman History
+float r = 2.5;            // Measurement Uncertainty
+float k = 0;            // Kalman Gain
+long lastDTMicros = 0;
 
 void setup() {
   // FILTER CONTROL SETUP
@@ -193,8 +211,11 @@ void setup() {
   pinMode(microstepPins[0], OUTPUT);
   pinMode(microstepPins[1], OUTPUT);
   pinMode(microstepPins[2], OUTPUT);
-  for(int i =0; i<20; i++){
+  for(int i =0; i<kN; i++){
     freqWindow[i] =0.0;
+  }
+  for(int i =0; i<20; i++){
+    freqChecks[i]=0.0;
   }
 
   // LCD SETUP
@@ -291,7 +312,8 @@ void loop() {
       break;
     case 2:
       if(curString > 5){
-        machineState = 0;
+        machineState = 4;                                                          
+        break;
       }
       if(newDisplay){
         newDisplay = false;
@@ -310,10 +332,15 @@ void loop() {
       // exit state
       steps = 0;
       digitalWrite(enablePin, HIGH);
+      for(int i =0; i<10; i++){
+        freqWindow[i] =0.0;
+      }
+      freqAvg = 0;
+      passedCheck=false;
       break;
     case 3:
       stringFrequency = tuningFrequencies[selectedTuning][curString];
-      filterFreq = 110 * stringFrequency;
+      filterFreq = 105 * stringFrequency;
       filterPWM->setPWM(filterPin, filterFreq, dutyCycle);
 
       if(newDisplay){
@@ -336,38 +363,96 @@ void loop() {
       }
       
       lcd.setCursor(8,1);
-      lcd.print(freqAvg);
+      lcd.print(F);
       lcd.setCursor(14,1);
       lcd.print("Hz");
       
       // Calculate the frequency offset and turn motor accordingly
       
       // FInd rolling average of 20 frequency samples
+      
       if(frequency != freqWindow[0]){
+        startTuning = true;
         freqAvg = 0;
-        for(int i =0; i<19; i++){
-          freqWindow[19-i]=freqWindow[18-i];
-          freqAvg+=freqWindow[19-i];
+        for(int i =0; i<kN-1; i++){
+          freqWindow[(kN-1)-i]=freqWindow[(kN-2)-i];
+          freqAvg+=freqWindow[9-i];
         }
         freqWindow[0]=frequency;
         freqAvg += frequency;
-        freqAvg = freqAvg/20.00;
+        freqAvg = freqAvg/kN;
+        
+
+        F = 0;
+        Fe = 1;
+        dt = (micros() - lastDTMicros)*0.000001;
+        lastDTMicros = micros();
+        for (int i = 0; i<kN; i++){
+          F = F + dt*dF;
+          Fe = Fe +(dt*dt*dFe)+q;
+          Fm = freqWindow[i];
+          if(Fm < 5){
+            startTuning=false;
+          }
+          k = Fe / (Fe + r);
+          F = F + k*(Fm - F);
+          Fe = (1-k)*Fe;
+          //Serial.print(i);
+          //Serial.print("  ");
+          //Serial.print(Fm);
+          //Serial.print("     ");
+          //Serial.println(F);
+        }
+        freqErr = (stringFrequency - freqOffset)- F;
+        //Serial.println(freqErr);
+
       }
+      
       //Serial.println(freqAvg);
 
-      // Enable the motor and calculate the error, then begin turning
       digitalWrite(enablePin, LOW);
-      freqErr = stringFrequency - freqAvg;
+      //freqErr = stringFrequency - F;
+      //Serial.println(F);
+      //Serial.println(freqErr);
       if(frequency > 40){
         stepErr = alpha * freqErr;   // Alpha is static value defined initially, the proportional gain
-        if(abs(freqErr)>0.5){
-          digitalWrite(dirPin, !(stepErr > 0));   //HIGH is CCW, LOW is CW
-          stepped = !stepped;
-          digitalWrite(stepPin, stepped);
-          steps++;
+        if(abs(freqErr)>1.0 && startTuning){
+          if(millis()-lastMicros > 20){
+            lastMicros = millis();
+            digitalWrite(dirPin, !(stepErr > 0));   //HIGH is CCW, LOW is CW
+            stepped = !stepped;
+            digitalWrite(stepPin, stepped);
+            steps++;
+          }
         }
 
-        if(abs(freqErr) < 1.5){
+        // If the current string frequency is higher than the desired (past a certain threshold, like 5 hz)
+        // subtract a big offset from it so it detunes further down and then tunes back up to the desired note
+        // pseudocode:
+        // if(freqErr>5){
+        //   newTargetFreq = stringFrequency-freqOffset;
+        // }
+        if(freqErr<-10.0){
+          freqOffset = 1.5;
+        }
+        if(freqErr>-10.0){
+          freqOffset=0.0;
+        }
+
+        if(frequency!=freqChecks[0]){
+          for(int i =0; i<20-1; i++){
+            freqChecks[(20-1)-i]=freqChecks[(20-2)-i];
+          }
+          freqChecks[0]=frequency;
+        }
+       
+        passedCheck = true;
+        for(int i = 0; i<20; i++){
+          if(abs(freqChecks[i]-stringFrequency)>0.6){
+            passedCheck=false;
+          }
+        }
+        if(passedCheck){
           //stepperPWM->setPWM(stepPin, 0, dutyCycle);
           digitalWrite(enablePin, HIGH);
           digitalWrite(dirPin, LOW);
@@ -377,11 +462,24 @@ void loop() {
           newDisplay = true;
         }
       }
+      
       // listen for frequency
       // determine error
       // move motor based on error
       // repeat until within tolerance
       // exit state
+    break;
+    case 4:
+      if(newDisplay){
+        newDisplay = false;
+        lcd.clear();
+        lcd.setCursor(0,0);
+        lcd.print("TUNING COMPLETE");
+        lcd.setCursor(11,1);
+        lcd.print("EXIT");
+        lcd.setCursor(15,1);
+        lcd.write(byte(1));
+      }
     break;
     
   }
@@ -420,7 +518,9 @@ void measurePeriod() {
     pulseEndTime = micros();
     newMeasurement = true;
     pulseCount = 0;
-    frequency = 1.0/(0.000001*(pulseEndTime-pulseStartTime)/maxPulses);
+    oldFreq = frequency;
+    frequency = 0.2 + 1.0/(0.000001*(pulseEndTime-pulseStartTime)/maxPulses);
+    
   }
 }
 
@@ -473,6 +573,9 @@ void enterPress(){
     else if(machineState == 2){
       machineState = 3;
     }
+    else if(machineState == 4){
+      machineState = 0;
+    }
     lastTimer=timer;
   }
   newDisplay = true;
@@ -497,6 +600,9 @@ void backPress(){
   newDisplay = true;
   if(timer-lastTimer > 200){
     newDisplay = true;
+    if(machineState==4){
+      machineState=0;
+    }
     if(machineState != 0){
       machineState = machineState -1;
     }
